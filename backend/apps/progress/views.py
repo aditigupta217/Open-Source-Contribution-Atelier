@@ -48,7 +48,9 @@ class MyProgressView(APIView):
 
     def post(self, request):
         lesson_slug = request.data.get("lesson_slug")
-        score = request.data.get("score", 100)
+        from apps.progress.models import XPMultiplierEvent
+        multiplier = XPMultiplierEvent.get_active_multiplier()
+        base_score = request.data.get("score", 100)
         completed = request.data.get("completed", True)
 
         try:
@@ -64,15 +66,27 @@ class MyProgressView(APIView):
                 difficulty="beginner",
             )
 
-        progress, created = LessonProgress.objects.update_or_create(
-            user=request.user,
-            lesson=lesson,
-            defaults={
-                "completed": completed,
-                "score": score,
-                "organization": request.user.organization,
-            },
-        )
+        try:
+            progress = LessonProgress.objects.get(user=request.user, lesson=lesson)
+            created = False
+            if progress.base_score != base_score or progress.completed != completed:
+                progress.completed = completed
+                progress.base_score = base_score
+                progress.multiplier_applied = multiplier
+                progress.score = int(base_score * multiplier)
+                progress.organization = request.user.organization
+                progress.save()
+        except LessonProgress.DoesNotExist:
+            progress = LessonProgress.objects.create(
+                user=request.user,
+                lesson=lesson,
+                completed=completed,
+                base_score=base_score,
+                multiplier_applied=multiplier,
+                score=int(base_score * multiplier),
+                organization=request.user.organization,
+            )
+            created = True
 
         from .tasks import evaluate_user_badges_task
 
@@ -95,11 +109,14 @@ class BulkSyncProgressView(APIView):
 
         synced = []
 
+        from apps.progress.models import XPMultiplierEvent
+        multiplier = XPMultiplierEvent.get_active_multiplier()
+
         with transaction.atomic():
             for item in serializer.validated_data["lessons"]:
 
                 lesson_slug = item["lesson_slug"]
-                score = item.get("score", 100)
+                base_score = item.get("score", 100)
                 completed = item.get("completed", True)
 
                 try:
@@ -113,11 +130,23 @@ class BulkSyncProgressView(APIView):
                         difficulty="beginner",
                     )
 
-                progress, _ = LessonProgress.objects.update_or_create(
-                    user=request.user,
-                    lesson=lesson,
-                    defaults={"completed": completed, "score": score},
-                )
+                try:
+                    progress = LessonProgress.objects.get(user=request.user, lesson=lesson)
+                    if progress.base_score != base_score or progress.completed != completed:
+                        progress.completed = completed
+                        progress.base_score = base_score
+                        progress.multiplier_applied = multiplier
+                        progress.score = int(base_score * multiplier)
+                        progress.save()
+                except LessonProgress.DoesNotExist:
+                    progress = LessonProgress.objects.create(
+                        user=request.user,
+                        lesson=lesson,
+                        completed=completed,
+                        base_score=base_score,
+                        multiplier_applied=multiplier,
+                        score=int(base_score * multiplier),
+                    )
 
                 synced.append(progress.id)
 
@@ -214,23 +243,31 @@ class BulkProgressUpdateView(APIView):
                 progress_to_create = []
                 progress_to_update = []
 
+                from apps.progress.models import XPMultiplierEvent
+                multiplier = XPMultiplierEvent.get_active_multiplier()
+
                 for item in validated_data:
                     lesson = existing_lessons[item["lesson_slug"]]
                     completed = item.get("completed", True)
-                    score = item.get("score", 100)
+                    base_score = item.get("score", 100)
 
                     if lesson.id in existing_progress:
                         prog = existing_progress[lesson.id]
-                        prog.completed = completed
-                        prog.score = score
-                        progress_to_update.append(prog)
+                        if prog.base_score != base_score or prog.completed != completed:
+                            prog.completed = completed
+                            prog.base_score = base_score
+                            prog.multiplier_applied = multiplier
+                            prog.score = int(base_score * multiplier)
+                            progress_to_update.append(prog)
                     else:
                         progress_to_create.append(
                             LessonProgress(
                                 user=request.user,
                                 lesson=lesson,
                                 completed=completed,
-                                score=score,
+                                base_score=base_score,
+                                multiplier_applied=multiplier,
+                                score=int(base_score * multiplier),
                             )
                         )
 
@@ -242,7 +279,7 @@ class BulkProgressUpdateView(APIView):
 
                 if progress_to_update:
                     LessonProgress.objects.bulk_update(
-                        progress_to_update, ["completed", "score"]
+                        progress_to_update, ["completed", "score", "base_score", "multiplier_applied"]
                     )
                     success_ids.extend([p.id for p in progress_to_update])
 
@@ -672,3 +709,43 @@ class RecommendationsView(APIView):
 
         serializer = LessonSerializer(recommended_lessons, many=True)
         return Response(serializer.data)
+
+from .models import CodeSubmission, PeerReview
+from .serializers import CodeSubmissionSerializer, PeerReviewSerializer
+
+class CodeSubmissionView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        submissions = CodeSubmission.objects.filter(status=CodeSubmission.Status.PENDING).exclude(user=request.user)
+        serializer = CodeSubmissionSerializer(submissions, many=True)
+        return Response(serializer.data)
+
+    def post(self, request):
+        serializer = CodeSubmissionSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(user=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PeerReviewView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, submission_id):
+        submission = get_object_or_404(CodeSubmission, id=submission_id)
+        
+        if submission.user == request.user:
+            return Response({"error": "Cannot review your own submission"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if PeerReview.objects.filter(submission=submission, reviewer=request.user).exists():
+            return Response({"error": "You have already reviewed this submission"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        serializer = PeerReviewSerializer(data=request.data)
+        if serializer.is_valid():
+            with transaction.atomic():
+                review = serializer.save(submission=submission, reviewer=request.user, points_earned=10)
+                submission.status = CodeSubmission.Status.REVIEWED
+                submission.save(update_fields=["status"])
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
